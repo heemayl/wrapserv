@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+#
+# wrapserv: Run service actions with all the init specific commands/arguments abstracted away.
+# Copyright (C) 2018 Readul Hasan Chayan (Heemayl) <me@heemayl.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with it.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+'''Script for running "service action" commands (e.g. `docker restart`)
+with init specific commands/argumengs abstracted away from the user.
+Works with systemd, upstart, sysv inits.
+Example: `wrapserv docker restart`, `wrapserv nginx status`.
+Check `wrapserv --help`.
+'''
+
+import os
+import shlex
+import subprocess
+import sys
+
+from abc import ABCMeta
+from argparse import ArgumentParser
+
+
+class InitDetectionException(Exception):
+    '''Custom exception.'''
+    pass
+    
+
+class BaseInit(object, metaclass=ABCMeta):
+    '''Base for all `init` systems. Designed
+    to be the base class for all. Non-overriden
+    methods are called using `service`.
+    '''
+    SERVICE_COMMAND_PATH = '/sbin/service' if os.path.isfile('/sbin/service') \
+                           else '/usr/sbin/service'
+    
+    def action(self, action_name):
+        '''Different actions on the service e.g. start/stop/restart.'''
+        command = '{} {} {}'.format(self.SERVICE_COMMAND_PATH,
+                                    self.service_name, action_name)
+        return run_command(command)
+
+    # These are basically placeholders for future scope
+    def start(self):
+        return self.action('start')
+
+    def stop(self):
+        return self.action('stop')
+
+    def restart(self):
+        return self.action('restart')
+
+    def reload(self):
+        return self.action('reload')
+
+    def status(self):
+        return self.action('status')
+    
+        
+class UpStart(BaseInit):
+    '''Stuffs for `upstart`.'''
+    def __init__(self, service_name):
+        self.service_name = service_name
+
+        
+class SysV(BaseInit):
+    '''Stuffs for SysV init.'''
+    def __init__(self, service_name):
+        self.service_name = service_name
+
+        
+class SystemD(BaseInit):
+    '''Stuffs for SystemD.'''
+    SERVICE_COMMAND_PATH = '/bin/systemctl' if os.path.\
+                           isfile('/bin/systemctl') else '/sbin/systemctl'
+    
+    def __init__(self, service_name):
+        self.service_name = service_name
+
+    def action(self, action_name):
+        command = '{} {} {}'.format(self.SERVICE_COMMAND_PATH,
+                                    action_name, self.service_name)
+        return run_command(command)
+
+    
+def print_msg(msg, flush_stream=False):
+    '''Wrapper for formatting-printing.'''
+    print('\n{}\n'.format(msg), end='\n', flush=flush_stream)
+    return
+
+
+def get_init_name():
+    '''Returns the System Init.'''
+    try:
+        init_path = os.path.realpath('/proc/1/exe')
+    except PermissionError:
+        print_msg('Please run the script as superuser.')
+        exit(126)
+    if 'systemd' in init_path and os.path.isdir('/etc/systemd/'):
+        init_name = 'systemd'
+        return init_name
+    try:
+        initctl = subprocess.check_output('/sbin/initctl --version',
+                                          shell=True)
+    except subprocess.CalledProcessError:
+        pass
+    else:
+        if b'upstart' in initctl.lower():
+            init_name = 'upstart'
+            return init_name
+    if os.path.isdir('/etc/init.d/'):
+        init_name = 'sysv'
+    else:
+        init_name = None
+    return init_name
+
+    
+def run_command(command):
+    '''Function for running the relevant command.
+    Takes the command to run as a string, then
+    makes it a shell escaped list and run! Sends
+    everything to standard streams. Returns the
+    exit status of the command.
+    '''
+    command = shlex.split(command)
+    try:
+        ret = subprocess.call(command, stdout=sys.stdout, stderr=sys.stderr)
+    except Exception as e:
+        raise InitDetectionException('Error: {}'.format(str(e)))
+    return ret
+    
+        
+def parse_arguments():
+    '''Getting and setting command line arguments.'''
+    parser = ArgumentParser(description='''Run service actions with all
+    the init specific commands/arguments abstracted away. You just need
+    to put the service name and desired action. Examples:
+    `wrapserv docker restart`, `wrapserv nginx reload`.
+    Multiple "service action" pairs are supported too e.g.
+    `wrapserv docker stop nginx status postfix start` -- here,
+    `wrapserv` will first stop docker (`dokcer stop`); if succeeds,
+    will check the status of nginx (`nginx status`), and if that succeeds,
+    will start postfix (`postfix start`), in that order.
+    So, this is essentially same as running
+    `wrapserv docker stop && wrapserv nginx status && wrapserv postfix start`.
+    In systemd, you can specify the unit types too e.g.
+    `wrapserv nginx.service reload`, `wrapserv timers.target status`.'''
+    )
+    parser.add_argument('-i', '--show-init-name', dest='init-name',
+                        action='store_true', required=False,
+                        help='Show the init name and exit.')
+    parser.add_argument('service_action', metavar='service action', nargs='*',
+                        help='"service action" e.g. sshd stop, postfix reload')
+    args_ns = parser.parse_args()
+    args_dict = vars(args_ns)
+    return args_dict
+
+
+if __name__ == '__main__':
+    args_dict = parse_arguments()
+    init_name = get_init_name()
+    if not init_name:
+        print_msg("I give up! Can't detect this System's Init!")
+        exit(0)
+    if args_dict.get('init-name'):
+        print_msg(init_name)
+        exit(0)
+    init_cls_map = {
+        'sysv': SysV,
+        'upstart': UpStart,
+        'systemd': SystemD,
+    }
+    service_action_list = args_dict['service_action']
+    if not service_action_list or (len(service_action_list) % 2) == 1:
+        try:
+            ret = run_command('{} -h'.format(sys.argv[0]))
+        except (FileNotFoundError, InitDetectionException):
+            ret = run_command('/usr/bin/python3 {} -h'.format(sys.argv[0]))
+        exit(127)
+    for (service_name, action_name) in zip(service_action_list[::2],
+                                           service_action_list[1::2]):
+        service_obj = init_cls_map[init_name](service_name)
+        try:
+            ret = getattr(service_obj, action_name)()
+        except AttributeError:
+            ret = getattr(service_obj, 'action')(action_name)
+        print_msg('Exit status: {}\n---'.format(ret))
+        if ret != 0:
+            exit(ret)
