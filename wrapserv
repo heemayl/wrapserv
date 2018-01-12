@@ -120,10 +120,7 @@ def get_init_name():
         if b'upstart' in initctl.lower():
             init_name = 'upstart'
             return init_name
-    if os.path.isdir('/etc/init.d/'):
-        init_name = 'sysv'
-    else:
-        init_name = None
+    init_name = 'sysv' if os.path.isdir('/etc/init.d/') else None
     return init_name
 
     
